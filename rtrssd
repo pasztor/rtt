@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+
+import os
+import time
+import urllib.request
+import configparser
+from io import StringIO
+import xml.etree.ElementTree as ET
+import xmlrpc.client
+from email.message import Message
+
+'''
+rTorrent downloader for RSS feeds
+Assumptions:
+    - You have a working rTorrent, with a configured scgi port available
+    - You have an scgi-http gateway configured for your running rtorrent
+    - Your rTorrent is configued to watch a watchdir and pickup torrent files from there
+      example entry for that in your .rtorrent.rc:
+        schedule = watch_directory,5,5,load.normal=/your/home/tw/*.torrent
+
+Write your configuration file as follows into your ${HOME}/.rtrssd.conf
+Example config file
+
+    [DEFAULT]
+    rtorrent = http://rt.gw:8080
+    infohash = custom:infoHash
+    watchdir = /your/home/tw
+
+    [example1]
+    rss = https://your.torrents.rss/?page=rss&q=yoursearchquery&other=params
+    directory_base = /store/debian/iso
+    maxItems = 3
+'''
+
+cfg = configparser.ConfigParser()
+
+cfg.read(os.path.join(os.environ['HOME'],'.rtrssd.conf'))
+
+# Process each section from the config
+for section in cfg.sections():
+
+    cfgs = cfg[section]
+    print(f'Going through the {section} section of your config file')
+
+    # Connect to the rtorrent's xmlrpc server
+    s = xmlrpc.client.ServerProxy(cfgs['rtorrent'])
+    dl_list = s.download_list()
+
+    # Download the RSS
+    with urllib.request.urlopen(cfgs['rss']) as r:
+        rss = r.read()
+
+    # Get the RSS namespace info
+    rss_namespaces = dict([
+        node for _, node in ET.iterparse(
+            StringIO(rss.decode('utf-8')), events=['start-ns']
+        )
+    ])
+
+    # Parse the RSS
+    tree = ET.fromstring(rss)
+    channel = tree.find('channel')
+
+    # Prepare count items if there's a max defined to process
+    numItems = 0
+    if cfgs.get('maxitems'):
+        maxItems = int(cfgs['maxitems'])
+    else:
+        maxItems = None
+
+    # Iterate through the items
+    for item in channel.iterfind('item'):
+        # Check if we've gone too far with the number if items
+        numItems += 1
+        if maxItems and numItems > maxItems:
+            break
+
+        # Extract essential info from current rss item
+        link = item.findall('link')[0].text
+        title = item.findall('title')[0].text
+        infohash = item.findall(
+                cfgs.get('infohash', 'infohash'),
+                rss_namespaces
+                )[0].text.upper()
+
+        print(f'Checking if {title} is already loaded: ', end='', flush=True)
+        if infohash in dl_list:
+            print('yepp')
+            continue
+        else:
+            print('Nope.')
+
+        with urllib.request.urlopen(link) as r:
+            msg = Message()
+            msg['Content-Disposition'] = r.headers['Content-Disposition']
+            filename = urllib.parse.unquote_plus(msg.get_filename())
+            print(f'Downloading {filename}')
+            with open(os.path.join(cfgs['watchdir'], filename), 'bw') as tf:
+                tf.write(r.read())
+
+        print('Waiting for rtorrent to pick it up from the watchdir: ', end='', flush=True)
+        loading = True
+        while loading:
+            try:
+                s.d.name(infohash)
+                loading = False
+                print(' Done')
+            except xmlrpc.client.Fault:
+                print('.', end='', flush=True)
+                time.sleep(1)
+
+        if 'directory_base' in cfgs.keys():
+            s.d.directory_base.set(infohash, cfgs['directory_base'])
+        elif 'directory' in cfgs.keys():
+            s.d.directory.set(cfgs['directory'])
+
+        print(f'Starting {title}')
+        s.d.start(infohash)
+
+    # Print an empty line at the end of the section processed
+    print('')
